@@ -10,10 +10,16 @@ REQUIRED_COLUMNS = [
     '月份', '機構', '主責人員', '個案', 
     '照管金額分配額度', '服務紀錄(不含自費)', 
     '服務項目', '政府服務項目單價', '服務紀錄組數', '服務紀錄使用額度',
-    '服務使用狀態' # Added per request. If missing, we will handle it.
+    '服務使用狀態', # Added per request.
+    '主單A單位',  # Added for A Unit Analysis
+    '給付額度',   # Added for Gap Analysis
+    'CMS',       # Added for Gap Analysis
+    '區域'        # Added for Region Analysis
 ]
 
 import io
+import json
+import urllib.request
 
 # --- Helper Functions ---
 def clean_currency_column(series):
@@ -34,32 +40,31 @@ def load_data(file):
     try:
         df = pd.read_excel(file)
         
-        # Soft check for '服務使用狀態' - if missing, warn but don't fail?
-        # Or strict? Let's be strict if the user specifically asked for it, 
-        # but let's allow it to be optional for backward compatibility if file is old.
+        # Soft check for '服務使用狀態'
         if '服務使用狀態' not in df.columns:
-            # Try to match fuzzy? No, just add placeholder
             df['服務使用狀態'] = '未知'
-        
-        # Verify columns exist (excluding valid optional ones if any)
-        # We enforce REQUIRED_COLUMNS now
-        missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-        if missing_cols:
-             st.error(f"Missing columns in uploaded file: {missing_cols}")
-             return None
+
+        # Soft check for '主單A單位'
+        if '主單A單位' not in df.columns:
+             df['主單A單位'] = '未知A單位'
+             
+        # Soft check for '給付額度' and 'CMS'
+        if '給付額度' not in df.columns:
+            df['給付額度'] = 0 
+        if 'CMS' not in df.columns:
+            df['CMS'] = '未知'
+            
+        # Soft check for '區域'
+        if '區域' not in df.columns:
+            df['區域'] = '未知區域'
 
         # Clean numeric columns
         df['照管金額分配額度'] = clean_currency_column(df['照管金額分配額度'])
         df['服務紀錄(不含自費)'] = clean_currency_column(df['服務紀錄(不含自費)'])
         df['政府服務項目單價'] = clean_currency_column(df['政府服務項目單價'])
-        df['服務紀錄使用額度'] = clean_currency_column(df['服務紀錄使用額度']) # Ensure detail cost is also numeric
+        df['服務紀錄使用額度'] = clean_currency_column(df['服務紀錄使用額度']) 
+        df['給付額度'] = clean_currency_column(df['給付額度'])
         
-        # Optimize Month for sorting: Try to convert to Int if possible
-        try:
-            df['月份'] = pd.to_numeric(df['月份'], errors='coerce').fillna(0).astype(int)
-        except:
-            pass 
-
         return df
     except Exception as e:
         st.error(f"Error loading file: {e}")
@@ -68,16 +73,23 @@ def load_data(file):
 def get_monthly_aggregated_data(df):
     """
     Aggregates data to the Case-Month level.
-    Rule: '照管金額分配額度' and '服務紀錄(不含自費)' are repeated per row, so take MAX.
     """
-    # Group by key identifiers
-    grouped = df.groupby(['月份', '機構', '主責人員', '個案']).agg({
+    if '服務使用狀態' not in df.columns: df['服務使用狀態'] = '未知'
+    if '區域' not in df.columns: df['區域'] = '未知'
+    if 'CMS' not in df.columns: df['CMS'] = '未知'
+
+    grouped = df.groupby(['月份', '機構', '主責人員', '個案', '主單A單位']).agg({
         '照管金額分配額度': 'max',
         '服務紀錄(不含自費)': 'max',
-        '服務使用狀態': 'first' # Take the first value found for this case-month
+        '給付額度': 'max', 
+        'CMS': 'first',   
+        '服務使用狀態': 'first',
+        '區域': 'first'
     }).reset_index()
     
     return grouped
+
+
 
 # --- Main App ---
 def main():
@@ -100,17 +112,39 @@ def main():
     agg_df = get_monthly_aggregated_data(raw_df)
 
     # Navigation
+    # Re-enabled "區域與狀態分析"
     page = st.sidebar.radio(
         "選擇頁面",
-        ["機構總覽", "雙月比較分析", "服務狀態統計", "督導/人員績效", "服務項目分析", "異常個案警示", "個案詳細分析"]
+        ["機構總覽", "區域與狀態分析", "服務狀態統計", "主單 A 單位關聯分析", "督導/人員績效", "服務項目分析", "異常個案警示", "個案詳細分析"]
     )
+    
+    st.sidebar.markdown("---")
+    
+    # Global Theme Selector
+    theme_options = {
+        "🌿 清新淡雅 (預設)": ("GnBu", "Blues"), 
+        "☀️ 溫暖活力": ("OrRd", "YlOrRd"),
+        "🤵 專業深色": ("viridis", "magma"),
+        "🌊 海洋藍調": ("YlGnBu", "PuBu"),
+        "🔮 神秘紫調": ("Purples", "RdPu")
+    }
+    
+    if 'theme_primary' not in st.session_state:
+        st.session_state.theme_primary = "GnBu"
+    if 'theme_secondary' not in st.session_state:
+        st.session_state.theme_secondary = "Blues"
+        
+    selected_theme_name = st.sidebar.selectbox("🎨 選擇圖表風格", list(theme_options.keys()), index=0)
+    st.session_state.theme_primary, st.session_state.theme_secondary = theme_options[selected_theme_name]
 
     if page == "機構總覽":
         page_agency_overview(agg_df)
-    elif page == "雙月比較分析":
-        page_comparison(agg_df)
+    elif page == "區域與狀態分析":
+        page_region_analysis(agg_df)
     elif page == "服務狀態統計":
         page_status_stats(agg_df)
+    elif page == "主單 A 單位關聯分析":
+        page_a_unit_analysis(agg_df)
     elif page == "督導/人員績效":
         page_supervisor_performance(agg_df)
     elif page == "服務項目分析":
@@ -119,6 +153,7 @@ def main():
         page_abnormal_alerts(agg_df)
     elif page == "個案詳細分析":
         page_case_detail(raw_df, agg_df)
+
 
 # --- Pages ---
 
@@ -233,9 +268,16 @@ def page_service_analysis(raw_df):
     months = sorted(raw_df['月份'].unique())
     selected_month = st.selectbox("選擇月份 (全選則不填)", ["全年度"] + list(months))
     
+    # Filter by Agency (New)
+    agencies = sorted(raw_df['機構'].unique())
+    selected_agency = st.selectbox("選擇機構 (全選則不填)", ["全部"] + list(agencies))
+    
     df_to_use = raw_df.copy()
     if selected_month != "全年度":
         df_to_use = df_to_use[df_to_use['月份'] == selected_month]
+        
+    if selected_agency != "全部":
+        df_to_use = df_to_use[df_to_use['機構'] == selected_agency]
 
     # Aggregate by Service Item
     # Metric 1: Total Cost (Sum of 服務紀錄使用額度)
@@ -254,7 +296,16 @@ def page_service_analysis(raw_df):
     top_cost = service_agg.sort_values('總金額', ascending=False).head(20)
     
     st.subheader(f"💰 花費最高的前 20 項服務 ({selected_month})")
-    fig_cost = px.bar(top_cost, x='總金額', y='服務項目', orientation='h', title='服務項目總金額排名', text_auto='.2s')
+    fig_cost = px.bar(
+        top_cost, 
+        x='總金額', 
+        y='服務項目', 
+        orientation='h', 
+        title='服務項目總金額排名', 
+        text_auto='.2s',
+        color='總金額',
+        color_continuous_scale=st.session_state.theme_primary
+    )
     fig_cost.update_layout(yaxis={'categoryorder':'total ascending'})
     fig_cost.update_traces(width=0.6) # Slightly thicker for horizontal bars to remain readable
     st.plotly_chart(fig_cost, use_container_width=True)
@@ -263,7 +314,16 @@ def page_service_analysis(raw_df):
     top_freq = service_agg.sort_values('使用次數', ascending=False).head(20)
     
     st.subheader(f"🔄 使用頻率最高的前 20 項服務 ({selected_month})")
-    fig_freq = px.bar(top_freq, x='使用次數', y='服務項目', orientation='h', title='服務項目使用次數排名', text_auto=True)
+    fig_freq = px.bar(
+        top_freq, 
+        x='使用次數', 
+        y='服務項目', 
+        orientation='h', 
+        title='服務項目使用次數排名', 
+        text_auto=True,
+        color='使用次數',
+        color_continuous_scale=st.session_state.theme_secondary
+    )
     fig_freq.update_layout(yaxis={'categoryorder':'total ascending'})
     fig_freq.update_traces(width=0.6)
     st.plotly_chart(fig_freq, use_container_width=True)
@@ -333,10 +393,10 @@ def page_abnormal_alerts(agg_df):
     current_data['Rate'] = (current_data['服務紀錄(不含自費)'] / current_data['照管金額分配額度'].replace(0, 1) * 100).round(2)
     
     # Thresholds
-    low_threshold = 30
+    low_threshold = 53
     high_threshold = 95
     
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📉 低使用率警示 (<30%)", "📈 高使用率警示 (>95%)", "🏆 貢獻度 80/20 法則 (VIP)", "🧨 驟跌預警 (MoM > 30%)", "📉 連續衰退警示 (連續3月下滑)"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([f"📉 低使用率警示 (<{low_threshold}%)", "📈 高使用率警示 (>95%)", "🏆 貢獻度 80/20 法則 (VIP)", "🧨 驟跌預警 (MoM > 30%)", "📉 連續衰退警示 (連續3月下滑)"])
     
     with tab1:
         low_usage = current_data[current_data['Rate'] < low_threshold].sort_values('Rate')
@@ -869,7 +929,7 @@ def page_agency_overview(agg_df):
         color='機構', # Stack by Agency
         marginal='box' # Show box plot on top
     )
-    fig_hist.add_vline(x=70, line_dash="dash", line_color="green", annotation_text="目標 70%")
+    fig_hist.add_vline(x=53, line_dash="dash", line_color="green", annotation_text="目標 53%")
     st.plotly_chart(fig_hist, use_container_width=True)
     
     with st.expander("💡 如何解讀個案使用率分佈 (點擊展開說明)"):
@@ -878,10 +938,10 @@ def page_agency_overview(agg_df):
         
         *   **X 軸 (使用率 %)**：數值越高代表個案額度用得越滿。
         *   **Y 軸 (Count)**：代表在該使用率區間的個案人數。
-        *   **綠色虛線 (目標 70%)**：理想的經營目標線。
+        *   **綠色虛線 (目標 53%)**：理想的經營目標線。
         
         **觀察重點：**
-        1.  **右偏分佈 (理想)**：大部分色塊集中在右側 (70%~100%)，代表大多數個案都穩定使用額度。
+        1.  **右偏分佈 (理想)**：大部分色塊集中在右側 (53%~100%)，代表大多數個案都穩定使用額度。
         2.  **雙峰分佈 (警訊)**：若左側 (0~30%) 出現另一個高峰，代表有大量「低使用率/無效」個案，可能是幽靈人口或潛在流失戶。
         3.  **箱型圖 (上方)**：
             *   **箱子中間線**：中位數，代表最中間那位個案的使用率。
@@ -1031,8 +1091,9 @@ def page_supervisor_performance(agg_df):
             orientation='h',
             title=f"{rank_month} 月份 - 督導業績排行 (依營收)",
             text_auto='.2s',
-            color='機構', # Useful if 'All' agencies selected
-            hover_data=['使用率(%)', '個案']
+            color='服務紀錄(不含自費)', # Color by metric for gradient
+            color_continuous_scale=st.session_state.theme_primary,
+            hover_data=['使用率(%)', '個案', '機構']
         )
         fig_rank.update_traces(textposition='outside')
         fig_rank.update_layout(yaxis={'categoryorder':'total ascending'})
@@ -1043,7 +1104,7 @@ def page_supervisor_performance(agg_df):
         st.dataframe(
             staff_rank.sort_values('服務紀錄(不含自費)', ascending=False)
             .style.format({'服務紀錄(不含自費)': '{:,.0f}', '照管金額分配額度': '{:,.0f}', '使用率(%)': '{:.1f}%'})
-            .background_gradient(subset=['服務紀錄(不含自費)'], cmap='Greens')
+            .background_gradient(subset=['服務紀錄(不含自費)'], cmap=st.session_state.theme_primary)
         )
 
 def page_case_detail(raw_df, agg_df):
@@ -1091,7 +1152,8 @@ def page_case_detail(raw_df, agg_df):
              (agg_df['主責人員'] == staff)
         ].copy()
         prev_data_full['Rate'] = (prev_data_full['服務紀錄(不含自費)'] / prev_data_full['照管金額分配額度'].replace(0, 1) * 100)
-        prev_map = prev_data_full.set_index('個案')['Rate']
+        # Fix for potential duplicates if A Unit differs but it's same case
+        prev_map = prev_data_full.groupby('個案')['Rate'].mean()
 
     # Display Cases
     # Avoid div by zero
@@ -1181,8 +1243,11 @@ def page_case_detail(raw_df, agg_df):
                 merged_details['abs_diff'] = merged_details['金額差異'].abs()
                 merged_details = merged_details.sort_values('abs_diff', ascending=False).drop(columns=['abs_diff'])
                 
+                # Add Quota Column (from case level)
+                merged_details['照管金額分配額度'] = row['照管金額分配額度']
+                
                 # Formatting Columns
-                display_cols = ['服務項目', '政府服務項目單價', '服務紀錄組數', '組數差異', '服務紀錄使用額度', '金額差異']
+                display_cols = ['服務項目', '政府服務項目單價', '服務紀錄組數', '組數差異', '服務紀錄使用額度', '金額差異', '照管金額分配額度']
                 
                 st.dataframe(
                     merged_details[display_cols].style
@@ -1191,17 +1256,20 @@ def page_case_detail(raw_df, agg_df):
                         '服務紀錄組數': '{:.0f}', 
                         '組數差異': '{:+.0f}',
                         '服務紀錄使用額度': '{:,.0f}',
-                        '金額差異': '{:+,.0f}'
+                        '金額差異': '{:+,.0f}',
+                        '照管金額分配額度': '{:,.0f}'
                     })
                     .background_gradient(subset=['金額差異'], cmap='RdBu', vmin=-5000, vmax=5000)
                     .applymap(lambda v: 'color: transparent' if v == 0 else '', subset=['組數差異', '金額差異']) # Visual cleanup
                 )
             else:
                 # Fallback if no prev month
+                curr_agg['照管金額分配額度'] = row['照管金額分配額度']
                 st.dataframe(curr_agg.style.format({
                     '政府服務項目單價': '{:.0f}', 
                     '服務紀錄組數': '{:.0f}',
-                    '服務紀錄使用額度': '{:,.0f}'
+                    '服務紀錄使用額度': '{:,.0f}',
+                    '照管金額分配額度': '{:,.0f}'
                 }))
 
 def page_comparison(agg_df):
@@ -1348,6 +1416,335 @@ def page_comparison(agg_df):
             )
     else:
         st.info("在此範圍內，兩期間無共同服務個案。")
+
+
+def page_a_unit_analysis(agg_df):
+    st.header("🔗A 單位關聯分析")
+    
+    # Filters
+    col1, col2 = st.columns(2)
+    months = sorted(agg_df['月份'].unique())
+    with col1:
+        selected_month = st.selectbox("選擇月份", months, index=len(months)-1 if months else 0, key='a_unit_month')
+    
+    agencies = sorted(agg_df['機構'].unique())
+    with col2:
+        selected_agency = st.selectbox("選擇機構", ["全部"] + list(agencies), key='a_unit_agency')
+        
+    # Theme is now global in sidebar, accessed via st.session_state
+    quota_color = st.session_state.theme_primary
+    usage_color = st.session_state.theme_secondary
+        
+    # Filter Data
+    df_used = agg_df[agg_df['月份'] == selected_month].copy()
+    if selected_agency != "全部":
+        df_used = df_used[df_used['機構'] == selected_agency]
+        
+    # Aggregation by A Unit
+    # Check if '主單A單位' exists (it should based on load_data)
+    if '主單A單位' not in df_used.columns:
+         st.error("資料中缺少 '主單A單位' 欄位，無法進行分析。")
+         return
+
+    # Calculate individual case rates first for distribution analysis
+    df_used['Rate'] = (df_used['服務紀錄(不含自費)'] / df_used['照管金額分配額度'].replace(0, 1) * 100)
+    
+    # Group by A Unit
+    a_unit_stats = df_used.groupby('主單A單位').agg({
+        '個案': 'nunique', # nunique for accurate case count
+        '照管金額分配額度': 'mean',
+        '給付額度': 'mean', # Add Benefit Amount
+        'Rate': 'mean',
+        '服務紀錄(不含自費)': 'mean' 
+    }).reset_index().rename(columns={
+        '個案': '個案數',
+        '照管金額分配額度': '平均核定額度',
+        '給付額度': '平均給付額度',
+        'Rate': '平均使用率(%)',
+    })
+    
+    # Calculate Gaps
+    a_unit_stats['平均額度差距'] = (a_unit_stats['平均給付額度'] - a_unit_stats['平均核定額度'])
+    a_unit_stats['平均分配率(%)'] = (a_unit_stats['平均核定額度'] / a_unit_stats['平均給付額度'].replace(0, 1) * 100)
+    
+    a_unit_stats['平均使用率(%)'] = a_unit_stats['平均使用率(%)'].round(1)
+    a_unit_stats['平均核定額度'] = a_unit_stats['平均核定額度'].round(0)
+    
+    # Overview Metrics
+    total_units = len(a_unit_stats)
+    max_quota_unit = a_unit_stats.loc[a_unit_stats['平均核定額度'].idxmax()] if not a_unit_stats.empty else None
+    max_rate_unit = a_unit_stats.loc[a_unit_stats['平均使用率(%)'].idxmax()] if not a_unit_stats.empty else None
+    
+    
+    def shorten_name(name):
+        # Common prefixes to strip for cleaner display
+        prefixes = ["社團法人", "財團法人", "有限責任", "台南市", "臺南市", "私立"]
+        short_name = name
+        for p in prefixes:
+            short_name = short_name.replace(p, "")
+        # Truncate if still too long
+        if len(short_name) > 10:
+            return short_name[:10] + "..."
+        return short_name
+
+    st.markdown("### 📊 概況總覽")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("合作 A 單位數量", total_units)
+    if max_quota_unit is not None:
+        full_name = max_quota_unit['主單A單位']
+        clean_name = full_name
+        for p in ["社團法人", "財團法人", "有限責任", "台南市", "臺南市", "私立"]:
+            clean_name = clean_name.replace(p, "")
+            
+        m2.markdown(f"""
+        <div style="padding: 0px 0px 10px 0px;">
+            <p style="margin-bottom: 0px; font-size: 0.8rem; color: #666;">最高平均額度單位</p>
+            <p style="margin: 0px; font-size: 1.1rem; font-weight: 600; line-height: 1.4; min-height: 3rem;">{clean_name}</p>
+            <p style="margin: 0px; font-size: 1rem; color: #09ab3b;">
+                ${max_quota_unit['平均核定額度']:,.0f} 
+                <span style="font-size: 0.8rem; color: #666;">(平均額度)</span>
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    if max_rate_unit is not None:
+        full_name = max_rate_unit['主單A單位']
+        clean_name = full_name
+        for p in ["社團法人", "財團法人", "有限責任", "台南市", "臺南市", "私立"]:
+            clean_name = clean_name.replace(p, "")
+            
+        m3.markdown(f"""
+        <div style="padding: 0px 0px 10px 0px;">
+            <p style="margin-bottom: 0px; font-size: 0.8rem; color: #666;">最高使用率單位</p>
+            <p style="margin: 0px; font-size: 1.1rem; font-weight: 600; line-height: 1.4; min-height: 3rem;">{clean_name}</p>
+            <p style="margin: 0px; font-size: 1rem; color: #09ab3b;">
+                {max_rate_unit['平均使用率(%)']:.1f}%
+                <span style="font-size: 0.8rem; color: #666;">(平均使用率(%))</span>
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    st.markdown("---")
+    
+    # Charts
+    # Chart 1: Average Quota
+    st.subheader("💰 各 A 單位平均核定額度比較")
+    # Sort by Quota
+    top_quota = a_unit_stats.sort_values('平均核定額度', ascending=True) # Asc for horizontal bar
+    fig_quota = px.bar(
+        top_quota, 
+        x='平均核定額度', 
+        y='主單A單位', 
+        orientation='h',
+        text_auto='.2s',
+        title='平均核定額度排名',
+        color='平均使用率(%)', # Color by usage rate to see correlation
+        color_continuous_scale=quota_color # Use selected theme
+    )
+    # Increase height for readability since we have more width now
+    fig_quota.update_layout(height=max(400, len(top_quota) * 25))
+    st.plotly_chart(fig_quota, use_container_width=True)
+    
+    st.markdown("---")
+
+    # Chart 2: Average Usage Rate
+    st.subheader("📈 各 A 單位平均使用率比較")
+    # Sort by Rate
+    top_rate = a_unit_stats.sort_values('平均使用率(%)', ascending=True)
+    fig_rate = px.bar(
+        top_rate, 
+        x='平均使用率(%)', 
+        y='主單A單位', 
+        orientation='h',
+        text_auto='.1f',
+        title='平均使用率排名',
+        color='平均核定額度',
+        color_continuous_scale=usage_color # Use selected theme
+    )
+    fig_rate.add_vline(x=53, line_dash="dash", line_color="red", annotation_text="警示 53%")
+    # Increase height for readability
+    fig_rate.update_layout(height=max(400, len(top_rate) * 25))
+    st.plotly_chart(fig_rate, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # Chart 3: Benefit vs Allocation Gap (New)
+    st.subheader("⚖️ 給付額度 vs. 分配額度 差異分析")
+    with st.expander("💡 如何解讀這張圖表？ (點擊展開)"):
+        st.markdown("""
+        **這張圖表協助您判斷 A 單位在核定個案額度時，是傾向「給好給滿 (大方)」還是「有所保留 (保守)」。**
+        
+        #### **1. 看棒子的長度 (平均額度差距)**
+        *   **代表意義**：政府給的上限 (CMS給付額度) 減去 實際核定的額度。也就是「沒用完而被保留下來的額度空間」。
+        *   **棒子越長 (數值大)**：代表差距越大，保留空間多，**判定較為「保守」或「嚴格」**。
+        *   **棒子越短 (數值小)**：代表差距越小，額度給得很滿，**判定較為「大方」或「寬鬆」**。
+
+        #### **2. 看顏色深淺 (平均分配率 %)**
+        *(註：顏色深淺依據您選擇的主題而定，通常深色代表數值高)*
+        *   **顏色越深 (分配率高)**：代表給的額度很接近上限 (例 >80%) 👉 **大方**。
+        *   **顏色越淺 (分配率低)**：代表給的額度離上限很遠 (例 <60%) 👉 **保守**。
+
+        ---
+        **⚡ 快速結論：**
+        *   想找**最嚴格 (省錢)** 的單位 ➡ 找 **棒子最長** 且 **顏色最淺** 的。
+        *   想找**最大方 (給滿)** 的單位 ➡ 找 **棒子最短** 且 **顏色最深** 的。
+        
+        **公式**：`平均分配率(%) = (平均核定額度 / 平均給付額度) * 100%`
+        """)
+    
+    # Filter out units with 0 Benefit Amount (if data missing)
+    gap_data = a_unit_stats[a_unit_stats['平均給付額度'] > 0].sort_values('平均額度差距', ascending=True)
+    
+    if not gap_data.empty:
+        fig_gap = px.bar(
+            gap_data,
+            x='平均額度差距',
+            y='主單A單位',
+            orientation='h',
+            text_auto='$,.0f',
+            title='各 A 單位平均額度保留空間 (給付額度 - 核定額度)',
+            color='平均分配率(%)', # Color by % allocated
+            color_continuous_scale=st.session_state.theme_secondary # Use secondary theme
+        )
+        fig_gap.update_layout(height=max(400, len(gap_data) * 25))
+        st.plotly_chart(fig_gap, use_container_width=True)
+    else:
+        st.info("無法顯示差異分析，請確認資料中是否包含有效的「給付額度 (CMS額度)」數據。")
+
+    st.markdown("---")
+
+    # Metrics Table (Enhanced)
+    st.subheader("額度與使用率關聯分佈 (詳細數據)")
+    
+    styled_df = (
+        a_unit_stats[['主單A單位', '個案數', '平均給付額度', '平均核定額度', '平均額度差距', '平均分配率(%)', '平均使用率(%)']]
+        .sort_values('平均額度差距', ascending=False)
+        .set_index('主單A單位')
+        .style
+        .format({
+            '平均給付額度': '${:,.0f}',
+            '平均核定額度': '${:,.0f}', 
+            '平均額度差距': '${:,.0f}',
+            '平均分配率(%)': '{:.1f}%',
+            '平均使用率(%)': '{:.1f}%'
+        })
+        .background_gradient(subset=['平均核定額度'], cmap=quota_color) 
+        .background_gradient(subset=['平均額度差距'], cmap='Reds') 
+        .background_gradient(subset=['平均使用率(%)'], cmap=usage_color)
+    )
+    
+    st.dataframe(styled_df, use_container_width=True, height=500)
+    
+    with st.expander("查看原始數據"):
+        st.dataframe(a_unit_stats)
+
+def page_region_analysis(agg_df):
+    st.header("🗺️ 區域與狀態分析")
+    
+    # Filters
+    col1, col2 = st.columns(2)
+    months = sorted(agg_df['月份'].unique())
+    with col1:
+        selected_month = st.selectbox("選擇月份", months, index=len(months)-1 if months else 0, key='region_month')
+    
+    agencies = sorted(agg_df['機構'].unique())
+    with col2:
+        selected_agency = st.selectbox("選擇機構", ["全部"] + list(agencies), key='region_agency')
+        
+    # Theme
+    theme_primary = st.session_state.theme_primary
+    
+    # Filter Data
+    df_filtered = agg_df[agg_df['月份'] == selected_month].copy()
+    if selected_agency != "全部":
+        df_filtered = df_filtered[df_filtered['機構'] == selected_agency]
+        
+    if df_filtered.empty:
+        st.warning("查無資料")
+        return
+
+    st.markdown("---")
+    
+    # Check for Region column
+    if '區域' not in df_filtered.columns or df_filtered['區域'].isnull().all():
+        st.error("資料中缺少 '區域' 欄位或內容為空，無法進行區域分析。")
+    else:
+        # 1. Region Analysis
+        st.subheader("📍 各區域個案人數統計")
+        
+        region_stats = df_filtered.groupby('區域')['個案'].nunique().reset_index()
+        region_stats.columns = ['區域', '個案人數']
+        region_stats = region_stats.sort_values('個案人數', ascending=False)
+        
+        col_chart, col_table = st.columns([2, 1])
+        
+        with col_chart:
+            fig_region = px.bar(
+                region_stats,
+                x='區域',
+                y='個案人數',
+                text='個案人數',
+                title=f'{selected_month}月 各區域個案分佈',
+                color='個案人數',
+                color_continuous_scale=theme_primary
+            )
+            fig_region.update_traces(textposition='outside', width=0.5)
+            st.plotly_chart(fig_region, use_container_width=True)
+            
+        with col_table:
+            st.write("區域分佈詳情")
+            region_stats['佔比(%)'] = (region_stats['個案人數'] / region_stats['個案人數'].sum() * 100).map('{:.1f}%'.format)
+            st.dataframe(
+                region_stats.set_index('區域').style.background_gradient(subset=['個案人數'], cmap=theme_primary),
+                use_container_width=True
+            )
+            
+    st.markdown("---")
+
+    st.markdown("---")
+
+    # 2. Service Status Analysis
+    st.subheader("📊 服務使用狀態統計")
+    
+    # Analyze Status - Standardize to 3 categories
+    def categorize_status(status):
+        s = str(status)
+        if s.startswith("暫停"):
+            return "暫停"
+        elif s.startswith("結案"):
+            return "結案"
+        elif s.startswith("服務中"):
+            return "服務中"
+        return s # Fallback for others (e.g. Unknown)
+
+    df_filtered['狀態分類'] = df_filtered['服務使用狀態'].apply(categorize_status)
+    
+    status_stats = df_filtered.groupby('狀態分類')['個案'].nunique().reset_index()
+    status_stats.columns = ['服務使用狀態', '個案人數']
+    status_stats = status_stats.sort_values('個案人數', ascending=False)
+    
+    col_status_chart, col_status_table = st.columns([1, 1])
+    
+    with col_status_chart:
+        fig_status = px.pie(
+            status_stats,
+            names='服務使用狀態',
+            values='個案人數',
+            title=f'{selected_month}月 服務狀態佔比',
+            hole=0.4,
+            color_discrete_sequence=px.colors.sequential.RdBu 
+        )
+        st.plotly_chart(fig_status, use_container_width=True)
+        
+    with col_status_table:
+        st.write("狀態分佈詳情")
+        status_stats['佔比(%)'] = (status_stats['個案人數'] / status_stats['個案人數'].sum() * 100).map('{:.1f}%'.format)
+        
+        st.dataframe(
+            status_stats.set_index('服務使用狀態'),
+            use_container_width=True
+        )
+
 
 if __name__ == "__main__":
     main()
