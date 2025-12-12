@@ -722,14 +722,14 @@ def page_agency_overview(agg_df):
     latest_month_df = agg_df[agg_df['月份'] == latest_month].copy()
     latest_month_df['Rate'] = (latest_month_df['服務紀錄(不含自費)'] / latest_month_df['照管金額分配額度'].replace(0, 1) * 100)
     
-    analysis_text += f"\n    - {latest_month}月份異常警示詳情 (使用率 < 30%)："
+    analysis_text += f"\n    - {latest_month}月份異常警示詳情 (使用率 < 53%)："
 
     agencies = sorted(latest_month_df['機構'].unique())
     for agency in agencies:
         agency_df = latest_month_df[latest_month_df['機構'] == agency]
         total_agency_cases = len(agency_df)
         if total_agency_cases > 0:
-            low_cases = len(agency_df[agency_df['Rate'] < 30])
+            low_cases = len(agency_df[agency_df['Rate'] < 53])
             ratio = (low_cases / total_agency_cases * 100)
             analysis_text += f"\n        - {agency}：{low_cases} 位 (佔該機構 {ratio:.1f}%)"
     
