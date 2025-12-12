@@ -100,7 +100,7 @@ def main():
     agg_df = get_monthly_aggregated_data(raw_df)
 
     # Navigation
-    page = st.sidebar.selectbox(
+    page = st.sidebar.radio(
         "選擇頁面",
         ["機構總覽", "雙月比較分析", "服務狀態統計", "督導/人員績效", "服務項目分析", "異常個案警示", "個案詳細分析"]
     )
@@ -336,7 +336,7 @@ def page_abnormal_alerts(agg_df):
     low_threshold = 30
     high_threshold = 95
     
-    tab1, tab2, tab3, tab4 = st.tabs(["📉 低使用率警示 (<30%)", "📈 高使用率警示 (>95%)", "🏆 貢獻度 80/20 法則 (VIP)", "🧨 驟跌預警 (MoM > 30%)"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📉 低使用率警示 (<30%)", "📈 高使用率警示 (>95%)", "🏆 貢獻度 80/20 法則 (VIP)", "🧨 驟跌預警 (MoM > 30%)", "📉 連續衰退警示 (連續3月下滑)"])
     
     with tab1:
         low_usage = current_data[current_data['Rate'] < low_threshold].sort_values('Rate')
@@ -484,6 +484,96 @@ def page_abnormal_alerts(agg_df):
                     .style.format({'上月(%)': '{:.1f}%', '本月(%)': '{:.1f}%', '跌幅(%)': '{:.1f}%'})
                 )
 
+    with tab5:
+        # Churn Risk: Continuous Decline over 3 months
+        # T (selected), T-1, T-2
+        m1 = selected_month
+        m2 = m1 - 1
+        m3 = m1 - 2
+        
+        valid_months = sorted(agg_df['月份'].unique())
+        
+        if m2 not in valid_months or m3 not in valid_months:
+             st.info(f"無法計算連續衰退預警，因為需要連續三個月的數據 (需包含 {m2}月, {m3}月)。")
+        else:
+            # Prepare Dataframes
+            # We need Agency, Staff, Case, Rate for M1, M2, M3
+            cols_needed = ['機構', '主責人員', '個案', '照管金額分配額度', '服務紀錄(不含自費)']
+            
+            df1 = agg_df[agg_df['月份'] == m1][cols_needed].copy()
+            df2 = agg_df[agg_df['月份'] == m2][cols_needed].copy()
+            df3 = agg_df[agg_df['月份'] == m3][cols_needed].copy()
+            
+            # Filter Agency if needed
+            if selected_agency != "全部":
+                df1 = df1[df1['機構'] == selected_agency]
+                df2 = df2[df2['機構'] == selected_agency]
+                df3 = df3[df3['機構'] == selected_agency]
+
+            # Calc Rates
+            def calc_rate_series(df):
+                return (df['服務紀錄(不含自費)'] / df['照管金額分配額度'].replace(0, 1) * 100)
+
+            df1['Rate_M1'] = calc_rate_series(df1)
+            df2['Rate_M2'] = calc_rate_series(df2)
+            df3['Rate_M3'] = calc_rate_series(df3)
+            
+            # Merge
+            # Inner join because we need the case to exist in all 3 months to say "continuous" decline?
+            # Or left join? If a case didn't exist in m3, it's not a "decline" from m3. So Inner is safer for specific "Churn Risk" definition.
+            merge_base = df1[['機構', '主責人員', '個案', 'Rate_M1', '服務使用狀態'] if '服務使用狀態' in df1.columns else ['機構', '主責人員', '個案', 'Rate_M1']]
+            if '服務使用狀態' not in merge_base.columns:
+                 # Try adding status from df1
+                 status_map = agg_df[agg_df['月份'] == m1][['機構', '主責人員', '個案', '服務使用狀態']].drop_duplicates()
+                 merge_base = merge_base.merge(status_map, on=['機構', '主責人員', '個案'], how='left')
+
+            m_churn = merge_base.merge(
+                df2[['機構', '主責人員', '個案', 'Rate_M2']], on=['機構', '主責人員', '個案'], how='inner'
+            ).merge(
+                df3[['機構', '主責人員', '個案', 'Rate_M3']], on=['機構', '主責人員', '個案'], how='inner'
+            )
+            
+            # Check Logic: Rate_M3 > Rate_M2 > Rate_M1
+            # Filter: strict decline
+            churn_risk = m_churn[
+                (m_churn['Rate_M3'] > m_churn['Rate_M2']) & 
+                (m_churn['Rate_M2'] > m_churn['Rate_M1'])
+            ].copy()
+            
+            # Calculate Total Drop
+            churn_risk['總跌幅'] = churn_risk['Rate_M3'] - churn_risk['Rate_M1']
+            
+            # Sort by Total Drop
+            churn_risk = churn_risk.sort_values('總跌幅', ascending=False)
+            
+            st.error(f"⚠️ 共有 {len(churn_risk)} 位個案呈現連續三個月使用率下滑")
+            
+            if not churn_risk.empty:
+                excel_churn = convert_df_to_excel(churn_risk)
+                st.download_button(
+                    label="📥 下載流失風險個案清單",
+                    data=excel_churn,
+                    file_name=f'流失風險個案_{selected_month}月.xlsx',
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    key='dl_churn'
+                )
+
+                st.dataframe(
+                    churn_risk[['機構', '主責人員', '個案', '服務使用狀態', 'Rate_M3', 'Rate_M2', 'Rate_M1', '總跌幅']]
+                    .rename(columns={
+                        'Rate_M3': f'{m3}月(%)', 
+                        'Rate_M2': f'{m2}月(%)', 
+                        'Rate_M1': f'{m1}月(%)'
+                    })
+                    .style.format({
+                        f'{m3}月(%)': '{:.1f}%', 
+                        f'{m2}月(%)': '{:.1f}%', 
+                        f'{m1}月(%)': '{:.1f}%',
+                        '總跌幅': '{:.1f}%'
+                    })
+                    .background_gradient(subset=['總跌幅'], cmap='Reds')
+                )
+
 def page_agency_overview(agg_df):
     st.header("📊 機構額度使用率總覽")
     
@@ -516,7 +606,7 @@ def page_agency_overview(agg_df):
     avg_rate = avg_rate_total # Using the overall average rate
     gap = (total_quota * 0.85 - total_revenue) # Potential revenue if rate reaches 85%
 
-    analysis_text = "**📝 智慧月報摘要：**\n"
+    analysis_text = "**📝 月報摘要：**\n"
 
     # Calculate MoM Growth (Revenue & Cases) Breakdown by Agency
     months_sorted = sorted(agg_df['月份'].unique())
@@ -586,12 +676,121 @@ def page_agency_overview(agg_df):
     # Use st.markdown with HTML instead of st.info
     st.markdown(
         f"""
-        <div style="background-color: #262730; padding: 15px; border-radius: 5px; border: 1px solid #464b5d;">
+        <div style="background-color: #262730; color: white; padding: 15px; border-radius: 5px; border: 1px solid #464b5d;">
         {analysis_text.replace(chr(10), '<br>')}
         </div>
         """,
         unsafe_allow_html=True
     )
+    
+    st.markdown("---")
+    
+    # --- Agency Performance Radar (New) ---
+    st.subheader("🎯 各機構綜合效能雷達圖")
+    
+    # Needs to be based on the LATEST month to be relevant current snapshot
+    radar_month = agg_df['月份'].max()
+    radar_df = agg_df[agg_df['月份'] == radar_month].copy()
+    
+    # Metrics
+    # 1. 效能 Efficiency: Avg Usage Rate
+    # 2. 產值 Value: Rev / Case
+    # 3. 產能 Productivity: Rev / Staff
+    # 4. 動能 Potential: % of cases > 80% usage
+    # 5. 貢獻 Impact: Total Rev (Normalized)
+    
+    radar_metrics = []
+    
+    radar_agencies = sorted(radar_df['機構'].unique())
+    
+    for ag in radar_agencies:
+        sub = radar_df[radar_df['機構'] == ag]
+        if sub.empty: continue
+        
+        # 1. Efficiency
+        sub['Rate'] = (sub['服務紀錄(不含自費)'] / sub['照管金額分配額度'].replace(0, 1) * 100)
+        eff = sub['Rate'].mean()
+        
+        # 2. Value
+        total_rev = sub['服務紀錄(不含自費)'].sum()
+        count_case = sub['個案'].nunique()
+        val = (total_rev / count_case) if count_case > 0 else 0
+        
+        # 3. Productivity
+        count_staff = sub['主責人員'].nunique()
+        prod = (total_rev / count_staff) if count_staff > 0 else 0
+        
+        # 4. Potential
+        high_perf = len(sub[sub['Rate'] >= 80])
+        pot = (high_perf / count_case * 100) if count_case > 0 else 0
+        
+        # 5. Impact 
+        imp = total_rev
+        
+        radar_metrics.append({
+            '機構': ag,
+            '效能 (平均使用率)': eff,
+            '產值 (人均營收)': val,
+            '產能 (督導平均產出)': prod,
+            '動能 (高績效個案佔比)': pot,
+            '貢獻 (總營收)': imp
+        })
+        
+    radar_data = pd.DataFrame(radar_metrics)
+    
+    # Normalization (Min-Max to 0-100)
+    # Efficiency and Potential are already 0-100 (mostly)
+    # Value, Productivity, Impact need scaling
+    
+    cols_to_norm = ['產值 (人均營收)', '產能 (督導平均產出)', '貢獻 (總營收)']
+    
+    # Initialize normalized df
+    radar_norm = radar_data.copy()
+    
+    for col in cols_to_norm:
+        min_v = radar_data[col].min()
+        max_v = radar_data[col].max()
+        if max_v > min_v:
+            radar_norm[col] = (radar_data[col] - min_v) / (max_v - min_v) * 100
+        else:
+            radar_norm[col] = 100 # If all same or single agency
+            
+    # For chart, melt
+    radar_melted = radar_norm.melt(
+        id_vars=['機構'], 
+        var_name='指標', 
+        value_name='分數'
+    )
+    
+    fig_radar = px.line_polar(
+        radar_melted, 
+        r='分數', 
+        theta='指標', 
+        color='機構', 
+        line_close=True,
+        title=f"各機構五力分析 ({radar_month}月份)",
+        range_r=[0, 100]
+    )
+    fig_radar.update_traces(fill='toself', opacity=0.4)
+    st.plotly_chart(fig_radar, use_container_width=True)
+    
+    with st.expander("查看原始數據"):
+        st.dataframe(radar_data.style.format({
+            '效能 (平均使用率)': '{:.1f}%',
+            '產值 (人均營收)': '${:,.0f}',
+            '產能 (督導平均產出)': '${:,.0f}',
+            '動能 (高績效個案佔比)': '{:.1f}%',
+            '貢獻 (總營收)': '${:,.0f}'
+        }))
+        
+    with st.expander("💡 如何解讀五力分析雷達圖 (點擊展開說明)"):
+        st.markdown("""
+        1.  **效能 (平均使用率)**：代表預算執行效率。高分表示大部分個案額度用好用滿；低分表示有閒置額度。
+        2.  **產值 (人均營收)**：每位個案帶來的營收貢獻。高分表示個案需求強度高；低分表示多為輕度使用者。
+        3.  **產能 (督導平均產出)**：每位督導管理的營收規模。高分表示管理效率高，能扛起較大業績。
+        4.  **動能 (高績效個案佔比)**：使用率 > 80% 的優質個案比例。高分表示主力客群穩定，體質健康。
+        5.  **貢獻 (總營收)**：在整體組織中的營收市佔率。圖形越飽滿代表全方位表現優異。
+        """)
 
     st.divider()
 
@@ -673,6 +872,22 @@ def page_agency_overview(agg_df):
     fig_hist.add_vline(x=70, line_dash="dash", line_color="green", annotation_text="目標 70%")
     st.plotly_chart(fig_hist, use_container_width=True)
     
+    with st.expander("💡 如何解讀個案使用率分佈 (點擊展開說明)"):
+        st.markdown("""
+        此圖表展示了該月份所有個案的「額度使用率」分佈情形，幫助您判斷整體營收結構是否健康。
+        
+        *   **X 軸 (使用率 %)**：數值越高代表個案額度用得越滿。
+        *   **Y 軸 (Count)**：代表在該使用率區間的個案人數。
+        *   **綠色虛線 (目標 70%)**：理想的經營目標線。
+        
+        **觀察重點：**
+        1.  **右偏分佈 (理想)**：大部分色塊集中在右側 (70%~100%)，代表大多數個案都穩定使用額度。
+        2.  **雙峰分佈 (警訊)**：若左側 (0~30%) 出現另一個高峰，代表有大量「低使用率/無效」個案，可能是幽靈人口或潛在流失戶。
+        3.  **箱型圖 (上方)**：
+            *   **箱子中間線**：中位數，代表最中間那位個案的使用率。
+            *   **箱子寬度**：主要個案群的分佈範圍。箱子越窄越好，代表服務一致性高。
+        """)
+    
     # Data Table
     with st.expander("查看詳細數據"):
         st.dataframe(agency_monthly)
@@ -697,7 +912,7 @@ def page_supervisor_performance(agg_df):
     
     # --- Tab 1: Trend Analysis ---
     # --- Tab 2: Workload Matrix (New) ---
-    t1, t2 = st.tabs(["📈 月度趨勢", "⚖️ 案量 vs. 績效矩陣"])
+    t1, t2, t3 = st.tabs(["📈 月度趨勢", "⚖️ 案量 vs. 績效矩陣", "🏆 業績排行"])
     
     with t1:
         # Aggregation for Trend
@@ -781,6 +996,55 @@ def page_supervisor_performance(agg_df):
         fig_matrix.add_vline(x=avg_load, line_dash="dash", line_color="orange", annotation_text=f"平均案量: {avg_load:.1f}")
         
         st.plotly_chart(fig_matrix, use_container_width=True)
+
+    with t3:
+        st.markdown("### 🏆 督導業績排行")
+        
+        # Reuse existing selectors? 
+        # Ideally, ranking is also monthly.
+        # Let's use a fresh selector or sync? Sync is hard across tabs without session state shenanigans.
+        # Let's just add a simple selector for this tab or reuse the one from Matrix if we move it up?
+        # Moving selectors up to the main page level is cleaner.
+        
+        # But to avoid refactoring the whole function, let's just add a month selector here locally.
+        rank_month = st.selectbox("選擇排序月份", months, index=len(months)-1 if months else 0, key='rank_month')
+        
+        rank_data = df_to_use[df_to_use['月份'] == rank_month]
+        
+        # Group by Staff
+        staff_rank = rank_data.groupby(['主責人員', '機構']).agg({
+            '服務紀錄(不含自費)': 'sum',
+            '照管金額分配額度': 'sum',
+            '個案': 'count'
+        }).reset_index()
+        
+        staff_rank['使用率(%)'] = (staff_rank['服務紀錄(不含自費)'] / staff_rank['照管金額分配額度'].replace(0, 1) * 100).round(2)
+        
+        # Sort by Revenue (Performance)
+        staff_rank = staff_rank.sort_values('服務紀錄(不含自費)', ascending=True) # Ascending for horizontal bar
+        
+        # Plot
+        fig_rank = px.bar(
+            staff_rank,
+            x='服務紀錄(不含自費)',
+            y='主責人員',
+            orientation='h',
+            title=f"{rank_month} 月份 - 督導業績排行 (依營收)",
+            text_auto='.2s',
+            color='機構', # Useful if 'All' agencies selected
+            hover_data=['使用率(%)', '個案']
+        )
+        fig_rank.update_traces(textposition='outside')
+        fig_rank.update_layout(yaxis={'categoryorder':'total ascending'})
+        
+        st.plotly_chart(fig_rank, use_container_width=True)
+        
+        # Table View
+        st.dataframe(
+            staff_rank.sort_values('服務紀錄(不含自費)', ascending=False)
+            .style.format({'服務紀錄(不含自費)': '{:,.0f}', '照管金額分配額度': '{:,.0f}', '使用率(%)': '{:.1f}%'})
+            .background_gradient(subset=['服務紀錄(不含自費)'], cmap='Greens')
+        )
 
 def page_case_detail(raw_df, agg_df):
     st.header("🔍 個案詳細分析")
@@ -892,12 +1156,22 @@ def page_case_detail(raw_df, agg_df):
                 ]
                 
                 prev_agg = prev_details.groupby('服務項目').agg({
+                    '政府服務項目單價': 'max',
                     '服務紀錄組數': 'sum',
                     '服務紀錄使用額度': 'sum'
-                }).reset_index().rename(columns={'服務紀錄組數': '組數(上月)', '服務紀錄使用額度': '金額(上月)'})
+                }).reset_index().rename(columns={
+                    '政府服務項目單價': '單價(上月)',
+                    '服務紀錄組數': '組數(上月)', 
+                    '服務紀錄使用額度': '金額(上月)'
+                })
                 
                 # Merge
                 merged_details = pd.merge(curr_agg, prev_agg, on='服務項目', how='outer').fillna(0)
+                
+                # Coalesce Unit Price: Use Current if > 0, else Prev
+                merged_details['政府服務項目單價'] = merged_details.apply(
+                    lambda x: x['政府服務項目單價'] if x['政府服務項目單價'] > 0 else x['單價(上月)'], axis=1
+                )
                 
                 # Calculate Deltas
                 merged_details['金額差異'] = merged_details['服務紀錄使用額度'] - merged_details['金額(上月)']
